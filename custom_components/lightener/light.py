@@ -259,8 +259,21 @@ class LightenerLight(LightGroup, RestoreEntity):
         return {
             attr: attributes[attr]
             for attr in PREFERRED_STATE_ATTRIBUTES
-            if attr in attributes
+            if attr in attributes and attributes[attr] is not None
         }
+
+    def _update_preferred_state(self, attributes: Mapping[str, Any]) -> None:
+        """Store or clear explicit persistent color/effect attributes."""
+
+        for attr in PREFERRED_STATE_ATTRIBUTES:
+            if attr not in attributes:
+                continue
+
+            value = attributes[attr]
+            if value is None:
+                self._preferred_state.pop(attr, None)
+            else:
+                self._preferred_state[attr] = value
 
     @staticmethod
     def _coerce_brightness(brightness: Any) -> int | None:
@@ -347,13 +360,13 @@ class LightenerLight(LightGroup, RestoreEntity):
 
         # List all attributes we want to forward.
         data = {
-            key: value for key, value in kwargs.items() if key in FORWARDED_ATTRIBUTES
+            key: value
+            for key, value in kwargs.items()
+            if key in FORWARDED_ATTRIBUTES and value is not None
         }
-        preferred_state = self._filter_preferred_state(data)
 
-        if preferred_state:
-            self._preferred_state.update(preferred_state)
-        elif not was_on and self._preferred_state:
+        self._update_preferred_state(kwargs)
+        if not was_on and self._preferred_state:
             data = {**self._preferred_state, **data}
 
         # Retrieve the brightness being set to the Lightener.

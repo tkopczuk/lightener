@@ -9,6 +9,7 @@ from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_BRIGHTNESS_PCT,
     ATTR_COLOR_TEMP_KELVIN,
+    ATTR_EFFECT,
     ATTR_SUPPORTED_COLOR_MODES,
     ATTR_RGB_COLOR,
     ATTR_TRANSITION,
@@ -331,6 +332,83 @@ async def test_lightener_light_turn_on_filters_restored_preferred_state(
         blocking=True,
         context=ANY,
     )
+
+
+async def test_lightener_light_turn_on_ignores_none_preferred_state_values(
+    hass: HomeAssistant, create_lightener
+):
+    """Test restored null values are not sent to child turn_on services."""
+
+    async_get_restore_state(hass).last_states["light.test"] = StoredState(
+        State("light.test", "off", {}),
+        RestoredExtraData(
+            {
+                "preferred_brightness": 7,
+                "preferred_state": {ATTR_EFFECT: None},
+            }
+        ),
+        dt_util.utcnow(),
+    )
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.test1": {}},
+        }
+    )
+
+    with patch.object(ServiceRegistry, "async_call") as async_call_mock:
+        await lightener.async_turn_on(transition=1.0)
+
+    async_call_mock.assert_called_once_with(
+        LIGHT_DOMAIN,
+        SERVICE_TURN_ON,
+        {
+            ATTR_ENTITY_ID: "light.test1",
+            ATTR_BRIGHTNESS: 7,
+            ATTR_TRANSITION: 1.0,
+        },
+        blocking=True,
+        context=ANY,
+    )
+
+
+async def test_lightener_light_turn_on_none_clears_remembered_effect(
+    hass: HomeAssistant, create_lightener
+):
+    """Test explicit null effect clears remembered effect without forwarding it."""
+
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.test1": {}},
+        }
+    )
+
+    await lightener.async_turn_on(brightness=50, effect="blink")
+    await hass.async_block_till_done()
+
+    with patch.object(ServiceRegistry, "async_call") as async_call_mock:
+        await lightener.async_turn_on(
+            brightness=7,
+            effect=None,
+            transition=1.0,
+        )
+
+    async_call_mock.assert_called_once_with(
+        LIGHT_DOMAIN,
+        SERVICE_TURN_ON,
+        {
+            ATTR_ENTITY_ID: "light.test1",
+            ATTR_BRIGHTNESS: 7,
+            ATTR_TRANSITION: 1.0,
+        },
+        blocking=True,
+        context=ANY,
+    )
+    assert lightener.extra_restore_state_data.as_dict() == {
+        "preferred_brightness": 7,
+        "preferred_state": {},
+    }
 
 
 async def test_lightener_light_restore_data_keeps_last_brightness_when_off(
