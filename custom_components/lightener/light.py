@@ -24,6 +24,9 @@ from homeassistant.const import (
     CONF_LIGHTS,
     SERVICE_TURN_OFF,
     SERVICE_TURN_ON,
+    STATE_ON,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
@@ -217,6 +220,7 @@ class LightenerLight(LightGroup):
         )
 
         self._is_frozen = True
+        desired_brightness_by_entity: dict[str, int] = {}
 
         async def _safe_service_call(
             entity: LightenerControlledLight, service: str, entity_data: dict
@@ -237,6 +241,11 @@ class LightenerLight(LightGroup):
                     entity.type,
                     entity_data,
                 )
+
+                if service == SERVICE_TURN_ON and ATTR_BRIGHTNESS in entity_data:
+                    desired_brightness_by_entity[entity.entity_id] = entity_data[
+                        ATTR_BRIGHTNESS
+                    ]
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.exception(
                     "Service `%s` for `%s` (%s) failed: %s; payload=%s",
@@ -281,6 +290,12 @@ class LightenerLight(LightGroup):
             """Refresh Lightener state after child service calls settle."""
             self.async_update_group_state()
             self.async_write_ha_state()
+
+            if desired_brightness_by_entity:
+                await asyncio.sleep(0)
+                await self._async_correct_child_brightness(desired_brightness_by_entity)
+                self.async_update_group_state()
+                self.async_write_ha_state()
 
         # Schedule the task to run.
         self.hass.async_create_task(
@@ -338,6 +353,50 @@ class LightenerLight(LightGroup):
             self.entity_id,
             self._attr_brightness,
         )
+
+    async def _async_correct_child_brightness(
+        self, desired_brightness_by_entity: dict[str, int]
+    ) -> None:
+        """Re-apply brightness to children that restored a stale level on turn_on."""
+
+        for entity_id, brightness in desired_brightness_by_entity.items():
+            state = self.hass.states.get(entity_id)
+
+            if state is None or state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+                continue
+
+            current_brightness = state.attributes.get(ATTR_BRIGHTNESS)
+            if state.state == STATE_ON and (
+                current_brightness is None
+                or abs(int(current_brightness) - brightness) <= 1
+            ):
+                continue
+
+            entity_data = {
+                ATTR_ENTITY_ID: entity_id,
+                ATTR_BRIGHTNESS: brightness,
+            }
+
+            try:
+                await self.hass.services.async_call(
+                    LIGHT_DOMAIN,
+                    SERVICE_TURN_ON,
+                    entity_data,
+                    blocking=True,
+                    context=self._context,
+                )
+                _LOGGER.debug(
+                    "Corrected brightness of `%s` to `%s` after turn_on",
+                    entity_id,
+                    brightness,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.exception(
+                    "Brightness correction for `%s` failed: %s; payload=%s",
+                    entity_id,
+                    exc,
+                    entity_data,
+                )
 
     @callback
     def async_write_ha_state(self) -> None:
