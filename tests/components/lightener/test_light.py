@@ -8,6 +8,7 @@ import pytest
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_BRIGHTNESS_PCT,
+    ATTR_COLOR_TEMP_KELVIN,
     ATTR_SUPPORTED_COLOR_MODES,
     ATTR_RGB_COLOR,
     ATTR_TRANSITION,
@@ -248,7 +249,12 @@ async def test_lightener_light_turn_on_uses_restored_brightness(
 
     async_get_restore_state(hass).last_states["light.test"] = StoredState(
         State("light.test", "off", {}),
-        RestoredExtraData({"preferred_brightness": 178}),
+        RestoredExtraData(
+            {
+                "preferred_brightness": 178,
+                "preferred_state": {ATTR_COLOR_TEMP_KELVIN: 2202},
+            }
+        ),
         dt_util.utcnow(),
     )
     lightener: LightenerLight = await create_lightener(
@@ -273,8 +279,58 @@ async def test_lightener_light_turn_on_uses_restored_brightness(
     assert isinstance(lightener, RestoreEntity)
     assert lightener.brightness == 178
     assert calls == [
-        (SERVICE_TURN_ON, {ATTR_ENTITY_ID: "light.test1", ATTR_BRIGHTNESS: 124})
+        (
+            SERVICE_TURN_ON,
+            {
+                ATTR_ENTITY_ID: "light.test1",
+                ATTR_BRIGHTNESS: 124,
+                ATTR_COLOR_TEMP_KELVIN: 2202,
+            },
+        )
     ]
+
+
+async def test_lightener_light_turn_on_filters_restored_preferred_state(
+    hass: HomeAssistant, create_lightener
+):
+    """Test restored preferred state only reuses persistent color attributes."""
+
+    async_get_restore_state(hass).last_states["light.test"] = StoredState(
+        State("light.test", "off", {}),
+        RestoredExtraData(
+            {
+                "preferred_brightness": 178,
+                "preferred_state": {
+                    ATTR_COLOR_TEMP_KELVIN: 2202,
+                    ATTR_BRIGHTNESS: 255,
+                    ATTR_ENTITY_ID: "light.wrong",
+                    ATTR_TRANSITION: 10,
+                },
+            }
+        ),
+        dt_util.utcnow(),
+    )
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.test1": {"100": "70"}},
+        }
+    )
+
+    with patch.object(ServiceRegistry, "async_call") as async_call_mock:
+        await lightener.async_turn_on()
+
+    async_call_mock.assert_called_once_with(
+        LIGHT_DOMAIN,
+        SERVICE_TURN_ON,
+        {
+            ATTR_ENTITY_ID: "light.test1",
+            ATTR_BRIGHTNESS: 124,
+            ATTR_COLOR_TEMP_KELVIN: 2202,
+        },
+        blocking=True,
+        context=ANY,
+    )
 
 
 async def test_lightener_light_restore_data_keeps_last_brightness_when_off(
@@ -289,7 +345,7 @@ async def test_lightener_light_restore_data_keeps_last_brightness_when_off(
         }
     )
 
-    await lightener.async_turn_on(brightness=178)
+    await lightener.async_turn_on(brightness=178, color_temp_kelvin=2202)
     await hass.async_block_till_done()
 
     await lightener.async_turn_off()
@@ -297,8 +353,36 @@ async def test_lightener_light_restore_data_keeps_last_brightness_when_off(
 
     assert lightener.brightness is None
     assert lightener.extra_restore_state_data.as_dict() == {
-        "preferred_brightness": 178
+        "preferred_brightness": 178,
+        "preferred_state": {ATTR_COLOR_TEMP_KELVIN: 2202},
     }
+
+
+async def test_lightener_light_turn_on_does_not_resend_color_on_brightness_change(
+    hass: HomeAssistant, create_lightener
+):
+    """Test brightness-only changes while on do not resend remembered color."""
+
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.test_temp": {"100": "70"}},
+        }
+    )
+
+    await lightener.async_turn_on(brightness=178, color_temp_kelvin=2202)
+    await hass.async_block_till_done()
+
+    with patch.object(ServiceRegistry, "async_call") as async_call_mock:
+        await lightener.async_turn_on(brightness=102)
+
+    async_call_mock.assert_called_once_with(
+        LIGHT_DOMAIN,
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: "light.test_temp", ATTR_BRIGHTNESS: 71},
+        blocking=True,
+        context=ANY,
+    )
 
 
 async def test_lightener_light_service_turn_on_maps_default_profile_brightness(
@@ -740,6 +824,22 @@ async def test_lightener_light_turn_on_go_off_if_brightness_0_transition(
         blocking=True,
         context=ANY,
     )
+
+
+async def test_lightener_light_does_not_expose_child_entity_ids_for_group_expansion(
+    hass: HomeAssistant, create_lightener
+):
+    """Test Lightener does not advertise itself as an expandable light group."""
+
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.test1": {}, "light.test2": {}},
+        }
+    )
+
+    assert ATTR_ENTITY_ID not in lightener.extra_state_attributes
+    assert ATTR_ENTITY_ID not in hass.states.get(lightener.entity_id).attributes
 
 
 async def test_lightener_light_color_mode_xy(hass: HomeAssistant, create_lightener):
@@ -1304,7 +1404,7 @@ async def test_async_setup_platform(hass):
     controlled_light: LightenerControlledLight = light._entities[0]
 
     assert isinstance(controlled_light, LightenerControlledLight)
-    assert light.extra_state_attributes["entity_id"][0] == "light.test2"
+    assert ATTR_ENTITY_ID not in light.extra_state_attributes
     assert controlled_light.entity_id == "light.test2"
     assert controlled_light.levels[255] == 26
 

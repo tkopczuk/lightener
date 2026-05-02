@@ -76,6 +76,8 @@ Once the configuration is confirmed, a new device becomes available, which can b
 
 The Lightener entity keeps its own on/off state and brightness. Controlled lights can all be off at a given Lightener brightness, and the Lightener entity will remain on at that brightness until you turn it off.
 
+Because Lightener owns the parent light state, it does not expose controlled lights through Home Assistant's standard group `entity_id` attribute. Integrations and automations should target the Lightener entity directly.
+
 One light to rule them all!
 
 ## Updating Settings From Services

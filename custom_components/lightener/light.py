@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any
 
@@ -12,7 +13,15 @@ import voluptuous as vol
 from homeassistant.components.group.light import FORWARDED_ATTRIBUTES, LightGroup
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
+    ATTR_COLOR_TEMP_KELVIN,
+    ATTR_EFFECT,
+    ATTR_HS_COLOR,
+    ATTR_RGB_COLOR,
+    ATTR_RGBW_COLOR,
+    ATTR_RGBWW_COLOR,
     ATTR_TRANSITION,
+    ATTR_WHITE,
+    ATTR_XY_COLOR,
     ColorMode,
 )
 from homeassistant.components.light import DOMAIN as LIGHT_DOMAIN
@@ -45,6 +54,19 @@ from .util import get_light_type
 _LOGGER = logging.getLogger(__name__)
 
 RESTORE_PREFERRED_BRIGHTNESS = "preferred_brightness"
+RESTORE_PREFERRED_STATE = "preferred_state"
+PREFERRED_STATE_ATTRIBUTES = frozenset(
+    {
+        ATTR_COLOR_TEMP_KELVIN,
+        ATTR_EFFECT,
+        ATTR_HS_COLOR,
+        ATTR_RGB_COLOR,
+        ATTR_RGBW_COLOR,
+        ATTR_RGBWW_COLOR,
+        ATTR_WHITE,
+        ATTR_XY_COLOR,
+    }
+)
 
 ENTITY_SCHEMA = vol.All(
     vol.DefaultTo({1: 1, 100: 100}),
@@ -70,13 +92,19 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 class LightenerRestoreStateData(ExtraStoredData):
     """Extra Lightener state stored across Home Assistant restarts."""
 
-    def __init__(self, preferred_brightness: int | None) -> None:
+    def __init__(
+        self, preferred_brightness: int | None, preferred_state: dict[str, Any]
+    ) -> None:
         """Initialize restore data."""
         self.preferred_brightness = preferred_brightness
+        self.preferred_state = preferred_state.copy()
 
     def as_dict(self) -> dict[str, Any]:
         """Return a dict representation of the restore data."""
-        return {RESTORE_PREFERRED_BRIGHTNESS: self.preferred_brightness}
+        return {
+            RESTORE_PREFERRED_BRIGHTNESS: self.preferred_brightness,
+            RESTORE_PREFERRED_STATE: self.preferred_state,
+        }
 
 
 async def async_setup_entry(
@@ -141,11 +169,15 @@ class LightenerLight(LightGroup, RestoreEntity):
             mode=None,
         )
 
+        # Lightener owns its parent state independently. Exposing child entity IDs
+        # makes group-aware integrations expand the entity and bypass Lightener.
+        self._attr_extra_state_attributes = {}
         self._attr_has_entity_name = unique_id is not None
         self._attr_is_on = False
         self._attr_brightness = None
         self._is_frozen = False
         self._preferred_brightness = None
+        self._preferred_state: dict[str, Any] = {}
         self._pending_child_turn_on: dict[str, dict[str, Any]] = {}
         self._child_correction_unsubs: dict[str, CALLBACK_TYPE] = {}
         self._immediate_child_corrections: set[str] = set()
@@ -167,7 +199,7 @@ class LightenerLight(LightGroup, RestoreEntity):
     async def async_added_to_hass(self) -> None:
         """Register listeners."""
         await super().async_added_to_hass()
-        await self._async_restore_preferred_brightness()
+        await self._async_restore_preferred_state()
 
         @callback
         def async_child_state_changed(event) -> None:
@@ -188,21 +220,47 @@ class LightenerLight(LightGroup, RestoreEntity):
     def extra_restore_state_data(self) -> ExtraStoredData | None:
         """Return extra state data to restore after Home Assistant restarts."""
 
-        return LightenerRestoreStateData(self._preferred_brightness)
+        return LightenerRestoreStateData(
+            self._preferred_brightness, self._preferred_state
+        )
 
-    async def _async_restore_preferred_brightness(self) -> None:
-        """Restore the last preferred Lightener brightness."""
+    async def _async_restore_preferred_state(self) -> None:
+        """Restore the last preferred Lightener brightness and color state."""
 
         brightness = None
+        preferred_state: dict[str, Any] = {}
+        last_state = None
 
         if (last_extra_data := await self.async_get_last_extra_data()) is not None:
-            brightness = last_extra_data.as_dict().get(RESTORE_PREFERRED_BRIGHTNESS)
+            restore_data = last_extra_data.as_dict()
+            brightness = restore_data.get(RESTORE_PREFERRED_BRIGHTNESS)
+            restored_preferred_state = restore_data.get(RESTORE_PREFERRED_STATE)
+            if isinstance(restored_preferred_state, dict):
+                preferred_state = self._filter_preferred_state(restored_preferred_state)
 
-        if brightness is None and (last_state := await self.async_get_last_state()):
+        if brightness is None or not preferred_state:
+            last_state = await self.async_get_last_state()
+
+        if brightness is None and last_state:
             brightness = last_state.attributes.get(ATTR_BRIGHTNESS)
 
         if (restored_brightness := self._coerce_brightness(brightness)) is not None:
             self._preferred_brightness = restored_brightness
+
+        if not preferred_state and last_state:
+            preferred_state = self._filter_preferred_state(last_state.attributes)
+
+        self._preferred_state = preferred_state
+
+    @staticmethod
+    def _filter_preferred_state(attributes: Mapping[str, Any]) -> dict[str, Any]:
+        """Return persistent color/effect attributes from light state data."""
+
+        return {
+            attr: attributes[attr]
+            for attr in PREFERRED_STATE_ATTRIBUTES
+            if attr in attributes
+        }
 
     @staticmethod
     def _coerce_brightness(brightness: Any) -> int | None:
@@ -285,11 +343,18 @@ class LightenerLight(LightGroup, RestoreEntity):
 
         # This is basically a copy of LightGroup::async_turn_on but it has been changed
         # so we can pass different brightness to each light.
+        was_on = self.is_on
 
         # List all attributes we want to forward.
         data = {
             key: value for key, value in kwargs.items() if key in FORWARDED_ATTRIBUTES
         }
+        preferred_state = self._filter_preferred_state(data)
+
+        if preferred_state:
+            self._preferred_state.update(preferred_state)
+        elif not was_on and self._preferred_state:
+            data = {**self._preferred_state, **data}
 
         # Retrieve the brightness being set to the Lightener.
         brightness = kwargs.get(ATTR_BRIGHTNESS)
