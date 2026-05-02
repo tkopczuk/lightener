@@ -4,7 +4,7 @@ from unittest.mock import ANY, Mock, patch
 from uuid import uuid4
 
 import pytest
-from homeassistant.components.light import ATTR_TRANSITION, ColorMode
+from homeassistant.components.light import ATTR_BRIGHTNESS, ATTR_TRANSITION, ColorMode
 from homeassistant.components.light import DOMAIN as LIGHT_DOMAIN
 from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TURN_OFF, SERVICE_TURN_ON
 from homeassistant.core import HomeAssistant, ServiceRegistry
@@ -170,6 +170,54 @@ async def test_lightener_light_turn_on_go_off_if_brightness_0(
     assert hass.states.get("light.test1").state == "off"
 
 
+async def test_lightener_light_turn_on_keeps_own_state_when_all_children_map_off(
+    hass: HomeAssistant, create_lightener
+):
+    """Test Lightener stays on when its brightness maps every child light off."""
+
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {
+                "light.test1": {"50": "0"},
+                "light.test2": {"50": "0"},
+            },
+        }
+    )
+
+    await lightener.async_turn_on(brightness=1)
+    await hass.async_block_till_done()
+
+    assert hass.states.get("light.test1").state == "off"
+    assert hass.states.get("light.test2").state == "off"
+    assert lightener.is_on is True
+    assert lightener.brightness == 1
+    assert hass.states.get(lightener.entity_id).state == "on"
+    assert hass.states.get(lightener.entity_id).attributes[ATTR_BRIGHTNESS] == 1
+
+
+async def test_lightener_light_turn_on_without_brightness_maps_default_level(
+    hass: HomeAssistant, create_lightener
+):
+    """Test plain turn_on still applies mapping through Lightener's default level."""
+
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.test1": {"100": "0"}},
+        }
+    )
+
+    await lightener.async_turn_on()
+    await hass.async_block_till_done()
+
+    assert hass.states.get("light.test1").state == "off"
+    assert lightener.is_on is True
+    assert lightener.brightness == 255
+    assert hass.states.get(lightener.entity_id).state == "on"
+    assert hass.states.get(lightener.entity_id).attributes[ATTR_BRIGHTNESS] == 255
+
+
 async def test_lightener_light_turn_on_translate_brightness(
     hass: HomeAssistant, create_lightener
 ):
@@ -188,6 +236,48 @@ async def test_lightener_light_turn_on_translate_brightness(
 
     assert hass.states.get("light.test1").state == "on"
     assert hass.states.get("light.test1").attributes["brightness"] == 129
+
+
+async def test_lightener_light_child_changes_do_not_replace_own_brightness(
+    hass: HomeAssistant, create_lightener
+):
+    """Test child light changes do not replace Lightener's own brightness."""
+
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.test1": {"50": "0"}},
+        }
+    )
+
+    await lightener.async_turn_on(brightness=192)
+    await hass.async_block_till_done()
+
+    hass.states.async_set(
+        entity_id="light.test1", new_state="on", attributes={ATTR_BRIGHTNESS: 1}
+    )
+
+    lightener.async_update_group_state()
+
+    assert lightener.is_on is True
+    assert lightener.brightness == 192
+
+
+async def test_lightener_light_child_turning_on_does_not_turn_parent_on(
+    hass: HomeAssistant, create_lightener
+):
+    """Test external child changes do not turn on the independent Lightener."""
+
+    lightener: LightenerLight = await create_lightener()
+
+    hass.states.async_set(
+        entity_id="light.test1", new_state="on", attributes={ATTR_BRIGHTNESS: 200}
+    )
+
+    lightener.async_update_group_state()
+
+    assert lightener.is_on is False
+    assert lightener.brightness is None
 
 
 async def test_lightener_light_turn_on_go_off_if_brightness_0_transition(
@@ -217,7 +307,7 @@ async def test_lightener_light_turn_on_go_off_if_brightness_0_transition(
 
 
 async def test_lightener_light_color_mode_xy(hass: HomeAssistant, create_lightener):
-    """Test that Lightener inherits the color mode of the controlled lights."""
+    """Test Lightener inherits child color mode while it is on."""
 
     lightener: LightenerLight = await create_lightener(
         config={
@@ -231,9 +321,9 @@ async def test_lightener_light_color_mode_xy(hass: HomeAssistant, create_lighten
         new_state="on",
         attributes={"color_mode": ColorMode.XY},
     )
+    lightener._attr_is_on = True  # pylint: disable=protected-access
 
-    await lightener.async_update_ha_state()
-    await hass.async_block_till_done()
+    lightener.async_update_group_state()
 
     assert hass.states.get("light.test1").attributes["color_mode"] == ColorMode.XY
 
@@ -312,7 +402,7 @@ async def test_lightener_light_color_mode_unknown(
 async def test_lightener_light_async_update_group_state(
     hass: HomeAssistant, create_lightener
 ):
-    """Test that turned on does nothing if the controlled light is already off."""
+    """Test child updates preserve Lightener's own state and brightness."""
 
     lightener: LightenerLight = await create_lightener(
         config={
@@ -322,6 +412,7 @@ async def test_lightener_light_async_update_group_state(
     )
 
     lightener._attr_brightness = 150  # pylint: disable=protected-access
+    lightener._attr_is_on = True  # pylint: disable=protected-access
 
     hass.states.async_set(
         entity_id="light.test1", new_state="on", attributes={"color_temp_kelvin": 3000}
@@ -332,7 +423,7 @@ async def test_lightener_light_async_update_group_state(
     assert lightener.is_on is True
     assert lightener.color_temp_kelvin == 3000
 
-    assert lightener.brightness == 255
+    assert lightener.brightness == 150
 
     hass.states.async_set(
         entity_id="light.test1", new_state="on", attributes={"brightness": 255}
@@ -340,7 +431,7 @@ async def test_lightener_light_async_update_group_state(
 
     lightener.async_update_group_state()
 
-    assert lightener.brightness == 255
+    assert lightener.brightness == 150
 
     hass.states.async_set(
         entity_id="light.test1", new_state="on", attributes={"brightness": 1}
@@ -348,7 +439,7 @@ async def test_lightener_light_async_update_group_state(
 
     lightener.async_update_group_state()
 
-    assert lightener.brightness == 128
+    assert lightener.brightness == 150
 
     hass.states.async_set(
         entity_id="light.test1", new_state="on", attributes={"brightness": 0}
@@ -357,13 +448,13 @@ async def test_lightener_light_async_update_group_state(
     lightener.async_update_group_state()
 
     assert lightener.is_on is True
-    assert lightener.brightness == 0
+    assert lightener.brightness == 150
 
 
 async def test_lightener_light_async_update_group_state_zero(
     hass: HomeAssistant, create_lightener
 ):
-    """Test that turned on does nothing if the controlled light is already off."""
+    """Test zero child brightness does not replace Lightener brightness."""
 
     lightener: LightenerLight = await create_lightener(
         config={
@@ -380,13 +471,13 @@ async def test_lightener_light_async_update_group_state_zero(
 
     lightener.async_update_group_state()
 
-    assert lightener.brightness == 0
+    assert lightener.brightness == 150
 
 
 async def test_lightener_light_async_update_group_state_unavailable(
     hass: HomeAssistant, create_lightener
 ):
-    """Test that turned on does nothing if the controlled light is already off."""
+    """Test unavailable children do not replace Lightener brightness."""
 
     lightener: LightenerLight = await create_lightener(
         config={
@@ -403,13 +494,13 @@ async def test_lightener_light_async_update_group_state_unavailable(
 
     lightener.async_update_group_state()
 
-    assert lightener.brightness == 128
+    assert lightener.brightness == 150
 
 
 async def test_lightener_light_async_update_group_state_no_match_no_change(
     hass: HomeAssistant, create_lightener
 ):
-    """Test that turned on does nothing if the controlled light is already off."""
+    """Test child brightness combinations do not replace Lightener brightness."""
 
     lightener: LightenerLight = await create_lightener(
         config={
@@ -418,7 +509,7 @@ async def test_lightener_light_async_update_group_state_no_match_no_change(
         }
     )
 
-    def test(test1: int, test2: int, result: int):
+    def test(test1: int, test2: int):
         lightener._attr_brightness = 150  # pylint: disable=protected-access
 
         hass.states.async_set(
@@ -431,34 +522,30 @@ async def test_lightener_light_async_update_group_state_no_match_no_change(
 
         lightener.async_update_group_state()
 
-        assert lightener.brightness == result
+        assert lightener.brightness == 150
 
-    # Matches
-    test(0, 29, 3)
-    test(1, 255, 128)
-
-    # No matches
-    test(129, 1, 150)
-    test(1, 254, 150)
-    test(1, 1, 150)
-    test(1, None, 150)
+    test(0, 29)
+    test(1, 255)
+    test(129, 1)
+    test(1, 254)
+    test(1, 1)
+    test(1, None)
 
 
 @pytest.mark.parametrize(
-    "test1, current, result",
+    "test1, current",
     [
-        (0, 10, 10),
-        (0, 20, 20),
-        # We're in the range, so the change must happen here.
-        (128, 20, 141),
-        (255, 200, 200),
-        (255, 255, 255),
+        (0, 10),
+        (0, 20),
+        (128, 20),
+        (255, 200),
+        (255, 255),
     ],
 )
-async def test_lightener_light_async_update_group_state_current_good_no_change(
-    test1, current, result, hass: HomeAssistant, create_lightener
+async def test_lightener_light_async_update_group_state_preserves_current_brightness(
+    test1, current, hass: HomeAssistant, create_lightener
 ):
-    """Test that turned on does nothing if the controlled light is already off."""
+    """Test child updates preserve Lightener's current brightness."""
 
     lightener: LightenerLight = await create_lightener(
         config={
@@ -467,7 +554,8 @@ async def test_lightener_light_async_update_group_state_current_good_no_change(
         }
     )
 
-    lightener._prefered_brightness = current  # pylint: disable=protected-access
+    lightener._attr_brightness = current  # pylint: disable=protected-access
+    lightener._preferred_brightness = current  # pylint: disable=protected-access
 
     hass.states.async_set(
         entity_id="light.test1", new_state="on", attributes={"brightness": test1}
@@ -475,13 +563,13 @@ async def test_lightener_light_async_update_group_state_current_good_no_change(
 
     lightener.async_update_group_state()
 
-    assert lightener.brightness == result
+    assert lightener.brightness == current
 
 
 async def test_lightener_light_async_update_group_state_onoff(
     hass: HomeAssistant, create_lightener
 ):
-    """Test that turned on does nothing if the controlled light is already off."""
+    """Test ONOFF children still produce brightness color mode while on."""
 
     lightener: LightenerLight = await create_lightener(
         config={
@@ -490,7 +578,7 @@ async def test_lightener_light_async_update_group_state_onoff(
         }
     )
 
-    # lightener._attr_brightness = 150    # pylint: disable=protected-access
+    lightener._attr_is_on = True  # pylint: disable=protected-access
 
     hass.states.async_set(
         entity_id="light.test_onoff",

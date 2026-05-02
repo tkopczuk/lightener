@@ -74,6 +74,8 @@ Note that we didn't have to define `40:50` for the LEDs, as the use case exempli
 
 Once the configuration is confirmed, a new device becomes available, which can be used in the UI or in automations to control all the lights in the room at once.
 
+The Lightener entity keeps its own on/off state and brightness. Controlled lights can all be off at a given Lightener brightness, and the Lightener entity will remain on at that brightness until you turn it off.
+
 One light to rule them all!
 
 ## Updating Settings From Services

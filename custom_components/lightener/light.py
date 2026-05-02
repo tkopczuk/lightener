@@ -24,7 +24,6 @@ from homeassistant.const import (
     CONF_LIGHTS,
     SERVICE_TURN_OFF,
     SERVICE_TURN_ON,
-    STATE_ON,
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
@@ -97,9 +96,6 @@ async def async_setup_platform(
 class LightenerLight(LightGroup):
     """Represents a Lightener light."""
 
-    _is_frozen = False
-    _prefered_brightness = None
-
     def __init__(
         self,
         hass: HomeAssistant,
@@ -127,6 +123,10 @@ class LightenerLight(LightGroup):
         )
 
         self._attr_has_entity_name = unique_id is not None
+        self._attr_is_on = False
+        self._attr_brightness = None
+        self._is_frozen = False
+        self._preferred_brightness = None
 
         if self._attr_has_entity_name:
             self._attr_device_info = DeviceInfo(
@@ -193,20 +193,22 @@ class LightenerLight(LightGroup):
             key: value for key, value in kwargs.items() if key in FORWARDED_ATTRIBUTES
         }
 
-        # Retrieve the brightness being set to the Lightener
+        # Retrieve the brightness being set to the Lightener.
         brightness = kwargs.get(ATTR_BRIGHTNESS)
 
-        # If the brightness is not being set, check if it was set in the Lightener.
-        if brightness is None and self._attr_brightness:
+        # If the brightness is not being set, reuse the last known Lightener level.
+        if brightness is None:
             brightness = self._attr_brightness
-        else:
-            # Update the Lightener brightness level to the one being set.
-            self._attr_brightness = brightness
 
         if brightness is None:
-            brightness = self._prefered_brightness
-        else:
-            self._prefered_brightness = brightness
+            brightness = self._preferred_brightness
+
+        if brightness is None:
+            brightness = 255
+
+        self._attr_is_on = True
+        self._attr_brightness = brightness
+        self._preferred_brightness = brightness
 
         _LOGGER.debug(
             "[Turn On] Attempting to set brightness of `%s` to `%s`",
@@ -245,42 +247,38 @@ class LightenerLight(LightGroup):
                     entity_data,
                 )
 
-        async with asyncio.TaskGroup() as group:
-            for entity in self._entities:
-                service = SERVICE_TURN_ON
-                entity_brightness = None
-
-                # If the brightness is being set in the lightener, translate it to the entity level.
-                if brightness is not None:
+        try:
+            async with asyncio.TaskGroup() as group:
+                for entity in self._entities:
+                    service = SERVICE_TURN_ON
                     entity_brightness = entity.translate_brightness(brightness)
 
-                # If the light brightness level is zero, we turn it off instead.
-                if entity_brightness == 0:
-                    service = SERVICE_TURN_OFF
-                    entity_data = {}
+                    # If the light brightness level is zero, we turn it off instead.
+                    if entity_brightness == 0:
+                        service = SERVICE_TURN_OFF
+                        entity_data = {}
 
-                    # "Transition" is the only additional data allowed with the turn_off service.
-                    if ATTR_TRANSITION in data:
-                        entity_data[ATTR_TRANSITION] = data[ATTR_TRANSITION]
-                else:
-                    # Make a copy of the data being sent to the lightener call so we can modify it.
-                    entity_data = data.copy()
+                        # "Transition" is the only additional data allowed with the turn_off service.
+                        if ATTR_TRANSITION in data:
+                            entity_data[ATTR_TRANSITION] = data[ATTR_TRANSITION]
+                    else:
+                        # Make a copy of the data being sent to the lightener call so we can modify it.
+                        entity_data = data.copy()
 
-                    # Set the translated brightness level.
-                    if brightness is not None:
+                        # Set the translated brightness level.
                         entity_data[ATTR_BRIGHTNESS] = entity_brightness
 
-                # Set the proper entity ID.
-                entity_data[ATTR_ENTITY_ID] = entity.entity_id
+                    # Set the proper entity ID.
+                    entity_data[ATTR_ENTITY_ID] = entity.entity_id
 
-                # Submit the service call concurrently, guarded to avoid cancelling siblings on failure.
-                group.create_task(_safe_service_call(entity, service, entity_data))
-
-        self._is_frozen = False
+                    # Submit the service call concurrently, guarded to avoid cancelling siblings on failure.
+                    group.create_task(_safe_service_call(entity, service, entity_data))
+        finally:
+            self._is_frozen = False
 
         # Define a coroutine as a ha task.
         async def _async_refresh() -> None:
-            """Turn on all lights controlled by this Lightener."""
+            """Refresh Lightener state after child service calls settle."""
             self.async_update_group_state()
             self.async_write_ha_state()
 
@@ -293,13 +291,19 @@ class LightenerLight(LightGroup):
         """Turn off all lights controlled by this Lightener."""
         self._is_frozen = True
 
-        self._prefered_brightness = self._attr_brightness
+        if self._attr_brightness is not None:
+            self._preferred_brightness = self._attr_brightness
 
-        await super().async_turn_off(**kwargs)
+        try:
+            await super().async_turn_off(**kwargs)
 
-        _LOGGER.debug("[Turn Off] Turned off `%s`", self.entity_id)
+            _LOGGER.debug("[Turn Off] Turned off `%s`", self.entity_id)
 
-        self._is_frozen = False
+            self._attr_is_on = False
+            self._attr_brightness = None
+        finally:
+            self._is_frozen = False
+
         self.async_update_group_state()
         self.async_write_ha_state()
 
@@ -318,78 +322,16 @@ class LightenerLight(LightGroup):
         if self._is_frozen:
             return
 
-        was_off = not self.is_on
+        current_is_on = self._attr_is_on
         current_brightness = self._attr_brightness
 
-        # Flag is this update is caused by this Lightener when calling turn_on.
-        is_lightener_change = False
-
-        # Let the Group integration make its magic, which includes recalculating the brightness.
+        # LightGroup refreshes useful child-derived attributes here, including
+        # availability, color/effect attributes, modes, and supported features.
+        # It also writes is_on and brightness, which Lightener owns independently.
         super().async_update_group_state()
 
-        common_level: set = None
-
-        if self.is_on:
-            # Calculates the brighteness by checking if the current levels in al controlled lights
-            # preciselly match one of the possible values for this lightener.
-            levels = []
-            for entity_id in self._entity_ids:
-                state = self.hass.states.get(entity_id)
-
-                # State may return None if the entity is not available, so we ignore it.
-                if state is not None:
-                    for entity in self._entities:
-                        if entity.entity_id == state.entity_id:
-                            # Check if the entity state change is caused by this Lightener.
-                            is_lightener_change = (
-                                True
-                                if is_lightener_change
-                                else (
-                                    state.context
-                                    and self._context
-                                    and state.context.id == self._context.id
-                                )
-                            )
-
-                            if state.state == STATE_ON:
-                                entity_brightness = state.attributes.get(
-                                    ATTR_BRIGHTNESS, 255
-                                )
-                            else:
-                                entity_brightness = 0
-
-                            _LOGGER.debug(
-                                "Current brightness of `%s` is `%s`",
-                                entity.entity_id,
-                                entity_brightness,
-                            )
-
-                            if entity_brightness is not None:
-                                levels.append(
-                                    entity.translate_brightness_back(entity_brightness)
-                                )
-                            else:
-                                levels.append([])
-
-            if levels:
-                # If the current lightener level is not present in the possible levels of the controlled lights.
-                if len({self._prefered_brightness}.intersection(*map(set, levels))) > 0:
-                    common_level = {self._prefered_brightness}
-                else:
-                    # Build a list of levels which are common for all lights.
-                    common_level = set.intersection(*map(set, levels))
-
-        if common_level:
-            # Use the common level if any was found.
-            self._attr_brightness = common_level.pop()
-        else:
-            self._attr_brightness = (
-                self._prefered_brightness
-                if is_lightener_change
-                else current_brightness
-                if self.is_on or was_off
-                else None
-            )
+        self._attr_is_on = current_is_on
+        self._attr_brightness = current_brightness
 
         _LOGGER.debug(
             "Setting the brightness of `%s` to `%s`",
