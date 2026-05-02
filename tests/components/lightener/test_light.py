@@ -10,9 +10,11 @@ from homeassistant.components.light import (
     ATTR_BRIGHTNESS_PCT,
     ATTR_COLOR_TEMP_KELVIN,
     ATTR_EFFECT,
-    ATTR_SUPPORTED_COLOR_MODES,
+    ATTR_HS_COLOR,
     ATTR_RGB_COLOR,
+    ATTR_SUPPORTED_COLOR_MODES,
     ATTR_TRANSITION,
+    ATTR_XY_COLOR,
     ColorMode,
 )
 from homeassistant.components.light import DATA_PROFILES, Profile
@@ -148,6 +150,11 @@ async def test_lightener_light_turn_on_forward(hass: HomeAssistant, create_light
     """Test if passed arguments are forwared when turned on."""
 
     lightener: LightenerLight = await create_lightener()
+    hass.states.async_set(
+        entity_id="light.test1",
+        new_state="off",
+        attributes={ATTR_SUPPORTED_COLOR_MODES: [ColorMode.COLOR_TEMP]},
+    )
 
     with patch.object(ServiceRegistry, "async_call") as async_call_mock:
         await lightener.async_turn_on(
@@ -261,8 +268,13 @@ async def test_lightener_light_turn_on_uses_restored_brightness(
     lightener: LightenerLight = await create_lightener(
         config={
             "friendly_name": "Test",
-            "entities": {"light.test1": {"100": "70"}},
+            "entities": {"light.test_temp": {"100": "70"}},
         }
+    )
+    hass.states.async_set(
+        entity_id="light.test_temp",
+        new_state="off",
+        attributes={ATTR_SUPPORTED_COLOR_MODES: [ColorMode.COLOR_TEMP]},
     )
     calls: list[tuple[str, dict]] = []
 
@@ -283,7 +295,7 @@ async def test_lightener_light_turn_on_uses_restored_brightness(
         (
             SERVICE_TURN_ON,
             {
-                ATTR_ENTITY_ID: "light.test1",
+                ATTR_ENTITY_ID: "light.test_temp",
                 ATTR_BRIGHTNESS: 124,
                 ATTR_COLOR_TEMP_KELVIN: 2202,
             },
@@ -317,6 +329,11 @@ async def test_lightener_light_turn_on_filters_restored_preferred_state(
             "entities": {"light.test1": {"100": "70"}},
         }
     )
+    hass.states.async_set(
+        entity_id="light.test1",
+        new_state="off",
+        attributes={ATTR_SUPPORTED_COLOR_MODES: [ColorMode.COLOR_TEMP]},
+    )
 
     with patch.object(ServiceRegistry, "async_call") as async_call_mock:
         await lightener.async_turn_on()
@@ -332,6 +349,145 @@ async def test_lightener_light_turn_on_filters_restored_preferred_state(
         blocking=True,
         context=ANY,
     )
+
+
+async def test_lightener_light_turn_on_normalizes_restored_color_descriptors(
+    hass: HomeAssistant, create_lightener
+):
+    """Test restored color state sends one child-supported color descriptor."""
+
+    async_get_restore_state(hass).last_states["light.test"] = StoredState(
+        State("light.test", "off", {}),
+        RestoredExtraData(
+            {
+                "preferred_brightness": 134,
+                "preferred_state": {
+                    ATTR_COLOR_TEMP_KELVIN: 2202,
+                    ATTR_XY_COLOR: [0.579, 0.388],
+                    ATTR_RGB_COLOR: [255, 146, 39],
+                    ATTR_HS_COLOR: [29.79, 84.553],
+                    ATTR_EFFECT: "blink",
+                },
+            }
+        ),
+        dt_util.utcnow(),
+    )
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.test1": {"100": "70"}},
+        }
+    )
+    hass.states.async_set(
+        entity_id="light.test1",
+        new_state="off",
+        attributes={ATTR_SUPPORTED_COLOR_MODES: [ColorMode.RGB]},
+    )
+
+    with patch.object(ServiceRegistry, "async_call") as async_call_mock:
+        await lightener.async_turn_on(transition=1.0)
+
+    async_call_mock.assert_called_once_with(
+        LIGHT_DOMAIN,
+        SERVICE_TURN_ON,
+        {
+            ATTR_ENTITY_ID: "light.test1",
+            ATTR_BRIGHTNESS: 94,
+            ATTR_RGB_COLOR: [255, 146, 39],
+            ATTR_EFFECT: "blink",
+            ATTR_TRANSITION: 1.0,
+        },
+        blocking=True,
+        context=ANY,
+    )
+
+
+async def test_lightener_light_turn_on_drops_unsupported_color_descriptor(
+    hass: HomeAssistant, create_lightener
+):
+    """Test an unsupported restored color descriptor is not sent to a child."""
+
+    async_get_restore_state(hass).last_states["light.test"] = StoredState(
+        State("light.test", "off", {}),
+        RestoredExtraData(
+            {
+                "preferred_brightness": 134,
+                "preferred_state": {ATTR_COLOR_TEMP_KELVIN: 2202},
+            }
+        ),
+        dt_util.utcnow(),
+    )
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.test1": {"100": "70"}},
+        }
+    )
+    hass.states.async_set(
+        entity_id="light.test1",
+        new_state="off",
+        attributes={ATTR_SUPPORTED_COLOR_MODES: [ColorMode.RGB]},
+    )
+
+    with patch.object(ServiceRegistry, "async_call") as async_call_mock:
+        await lightener.async_turn_on(transition=1.0)
+
+    async_call_mock.assert_called_once_with(
+        LIGHT_DOMAIN,
+        SERVICE_TURN_ON,
+        {
+            ATTR_ENTITY_ID: "light.test1",
+            ATTR_BRIGHTNESS: 94,
+            ATTR_TRANSITION: 1.0,
+        },
+        blocking=True,
+        context=ANY,
+    )
+    assert lightener.extra_restore_state_data.as_dict() == {
+        "preferred_brightness": 134,
+        "preferred_state": {ATTR_COLOR_TEMP_KELVIN: 2202},
+    }
+
+
+async def test_lightener_light_turn_on_new_color_descriptor_clears_old_descriptor(
+    hass: HomeAssistant, create_lightener
+):
+    """Test changing color descriptor replaces the remembered color descriptor."""
+
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.test1": {"100": "70"}},
+        }
+    )
+
+    await lightener.async_turn_on(brightness=134, color_temp_kelvin=2202)
+    await hass.async_block_till_done()
+
+    hass.states.async_set(
+        entity_id="light.test1",
+        new_state="on",
+        attributes={ATTR_SUPPORTED_COLOR_MODES: [ColorMode.RGB]},
+    )
+
+    with patch.object(ServiceRegistry, "async_call") as async_call_mock:
+        await lightener.async_turn_on(brightness=135, rgb_color=(255, 146, 39))
+
+    async_call_mock.assert_called_once_with(
+        LIGHT_DOMAIN,
+        SERVICE_TURN_ON,
+        {
+            ATTR_ENTITY_ID: "light.test1",
+            ATTR_BRIGHTNESS: 94,
+            ATTR_RGB_COLOR: (255, 146, 39),
+        },
+        blocking=True,
+        context=ANY,
+    )
+    assert lightener.extra_restore_state_data.as_dict() == {
+        "preferred_brightness": 135,
+        "preferred_state": {ATTR_RGB_COLOR: (255, 146, 39)},
+    }
 
 
 async def test_lightener_light_turn_on_ignores_none_preferred_state_values(

@@ -19,6 +19,7 @@ from homeassistant.components.light import (
     ATTR_RGB_COLOR,
     ATTR_RGBW_COLOR,
     ATTR_RGBWW_COLOR,
+    ATTR_SUPPORTED_COLOR_MODES,
     ATTR_TRANSITION,
     ATTR_WHITE,
     ATTR_XY_COLOR,
@@ -55,16 +56,28 @@ _LOGGER = logging.getLogger(__name__)
 
 RESTORE_PREFERRED_BRIGHTNESS = "preferred_brightness"
 RESTORE_PREFERRED_STATE = "preferred_state"
+COLOR_DESCRIPTOR_ATTRIBUTES = (
+    ATTR_COLOR_TEMP_KELVIN,
+    ATTR_RGBWW_COLOR,
+    ATTR_RGBW_COLOR,
+    ATTR_RGB_COLOR,
+    ATTR_HS_COLOR,
+    ATTR_XY_COLOR,
+    ATTR_WHITE,
+)
+COLOR_DESCRIPTOR_MODES = {
+    ATTR_COLOR_TEMP_KELVIN: ColorMode.COLOR_TEMP,
+    ATTR_HS_COLOR: ColorMode.HS,
+    ATTR_RGB_COLOR: ColorMode.RGB,
+    ATTR_RGBW_COLOR: ColorMode.RGBW,
+    ATTR_RGBWW_COLOR: ColorMode.RGBWW,
+    ATTR_WHITE: ColorMode.WHITE,
+    ATTR_XY_COLOR: ColorMode.XY,
+}
 PREFERRED_STATE_ATTRIBUTES = frozenset(
     {
-        ATTR_COLOR_TEMP_KELVIN,
         ATTR_EFFECT,
-        ATTR_HS_COLOR,
-        ATTR_RGB_COLOR,
-        ATTR_RGBW_COLOR,
-        ATTR_RGBWW_COLOR,
-        ATTR_WHITE,
-        ATTR_XY_COLOR,
+        *COLOR_DESCRIPTOR_ATTRIBUTES,
     }
 )
 
@@ -265,15 +278,70 @@ class LightenerLight(LightGroup, RestoreEntity):
     def _update_preferred_state(self, attributes: Mapping[str, Any]) -> None:
         """Store or clear explicit persistent color/effect attributes."""
 
-        for attr in PREFERRED_STATE_ATTRIBUTES:
-            if attr not in attributes:
-                continue
-
-            value = attributes[attr]
-            if value is None:
+        if any(attr in attributes for attr in COLOR_DESCRIPTOR_ATTRIBUTES):
+            for attr in COLOR_DESCRIPTOR_ATTRIBUTES:
                 self._preferred_state.pop(attr, None)
-            else:
-                self._preferred_state[attr] = value
+
+            self._preferred_state.update(
+                {
+                    attr: attributes[attr]
+                    for attr in COLOR_DESCRIPTOR_ATTRIBUTES
+                    if attr in attributes and attributes[attr] is not None
+                }
+            )
+
+        if ATTR_EFFECT not in attributes:
+            return
+
+        effect = attributes[ATTR_EFFECT]
+        if effect is None:
+            self._preferred_state.pop(ATTR_EFFECT, None)
+        else:
+            self._preferred_state[ATTR_EFFECT] = effect
+
+    @staticmethod
+    def _select_color_descriptor(
+        data: Mapping[str, Any], supported_color_modes: set[str] | None
+    ) -> str | None:
+        """Return the color descriptor to send for the child's supported modes."""
+
+        if supported_color_modes is not None:
+            for attr in COLOR_DESCRIPTOR_ATTRIBUTES:
+                if (
+                    attr in data
+                    and COLOR_DESCRIPTOR_MODES[attr] in supported_color_modes
+                ):
+                    return attr
+
+            return None
+
+        for attr in COLOR_DESCRIPTOR_ATTRIBUTES:
+            if attr in data:
+                return attr
+
+        return None
+
+    def _filter_child_color_descriptors(
+        self, entity_id: str, entity_data: dict[str, Any]
+    ) -> None:
+        """Keep at most one color descriptor supported by the child light."""
+
+        state = self.hass.states.get(entity_id)
+        supported_color_modes_attr = (
+            state.attributes.get(ATTR_SUPPORTED_COLOR_MODES) if state else None
+        )
+        supported_color_modes = (
+            set(supported_color_modes_attr)
+            if supported_color_modes_attr is not None
+            else None
+        )
+        selected_attr = self._select_color_descriptor(
+            entity_data, supported_color_modes
+        )
+
+        for attr in COLOR_DESCRIPTOR_ATTRIBUTES:
+            if attr != selected_attr:
+                entity_data.pop(attr, None)
 
     @staticmethod
     def _coerce_brightness(brightness: Any) -> int | None:
@@ -450,6 +518,11 @@ class LightenerLight(LightGroup, RestoreEntity):
                         else:
                             # Set the translated brightness level.
                             entity_data[ATTR_BRIGHTNESS] = entity_brightness
+
+                    if service == SERVICE_TURN_ON:
+                        self._filter_child_color_descriptors(
+                            entity.entity_id, entity_data
+                        )
 
                     # Set the proper entity ID.
                     entity_data[ATTR_ENTITY_ID] = entity.entity_id
