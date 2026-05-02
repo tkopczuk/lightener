@@ -28,11 +28,13 @@ from homeassistant.const import (
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.config_validation import PLATFORM_SCHEMA
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_call_later, async_track_state_change_event
+from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.util.color import value_to_brightness
 
@@ -41,6 +43,8 @@ from .const import DOMAIN, TYPE_ONOFF
 from .util import get_light_type
 
 _LOGGER = logging.getLogger(__name__)
+
+RESTORE_PREFERRED_BRIGHTNESS = "preferred_brightness"
 
 ENTITY_SCHEMA = vol.All(
     vol.DefaultTo({1: 1, 100: 100}),
@@ -61,6 +65,18 @@ LIGHT_SCHEMA = vol.Schema(
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     {vol.Required(CONF_LIGHTS): cv.schema_with_slug_keys(LIGHT_SCHEMA)}
 )
+
+
+class LightenerRestoreStateData(ExtraStoredData):
+    """Extra Lightener state stored across Home Assistant restarts."""
+
+    def __init__(self, preferred_brightness: int | None) -> None:
+        """Initialize restore data."""
+        self.preferred_brightness = preferred_brightness
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a dict representation of the restore data."""
+        return {RESTORE_PREFERRED_BRIGHTNESS: self.preferred_brightness}
 
 
 async def async_setup_entry(
@@ -96,7 +112,7 @@ async def async_setup_platform(
     async_add_entities(lights)
 
 
-class LightenerLight(LightGroup):
+class LightenerLight(LightGroup, RestoreEntity):
     """Represents a Lightener light."""
 
     def __init__(
@@ -130,6 +146,10 @@ class LightenerLight(LightGroup):
         self._attr_brightness = None
         self._is_frozen = False
         self._preferred_brightness = None
+        self._pending_child_turn_on: dict[str, dict[str, Any]] = {}
+        self._child_correction_unsubs: dict[str, CALLBACK_TYPE] = {}
+        self._immediate_child_corrections: set[str] = set()
+        self._child_correction_debounce = 1.0
 
         if self._attr_has_entity_name:
             self._attr_device_info = DeviceInfo(
@@ -144,6 +164,63 @@ class LightenerLight(LightGroup):
             config_data[CONF_FRIENDLY_NAME],
         )
 
+    async def async_added_to_hass(self) -> None:
+        """Register listeners."""
+        await super().async_added_to_hass()
+        await self._async_restore_preferred_brightness()
+
+        @callback
+        def async_child_state_changed(event) -> None:
+            """Correct child state after a child reports stale target attributes."""
+            self._async_maybe_correct_child_state(
+                event.data["entity_id"], event.data["new_state"]
+            )
+
+        self.async_on_remove(
+            async_track_state_change_event(
+                self.hass,
+                self._entity_ids,
+                async_child_state_changed,
+            )
+        )
+
+    @property
+    def extra_restore_state_data(self) -> ExtraStoredData | None:
+        """Return extra state data to restore after Home Assistant restarts."""
+
+        return LightenerRestoreStateData(self._preferred_brightness)
+
+    async def _async_restore_preferred_brightness(self) -> None:
+        """Restore the last preferred Lightener brightness."""
+
+        brightness = None
+
+        if (last_extra_data := await self.async_get_last_extra_data()) is not None:
+            brightness = last_extra_data.as_dict().get(RESTORE_PREFERRED_BRIGHTNESS)
+
+        if brightness is None and (last_state := await self.async_get_last_state()):
+            brightness = last_state.attributes.get(ATTR_BRIGHTNESS)
+
+        if (restored_brightness := self._coerce_brightness(brightness)) is not None:
+            self._preferred_brightness = restored_brightness
+
+    @staticmethod
+    def _coerce_brightness(brightness: Any) -> int | None:
+        """Coerce a restored brightness value into Home Assistant's raw range."""
+
+        if brightness is None:
+            return None
+
+        try:
+            restored_brightness = int(brightness)
+        except (TypeError, ValueError):
+            return None
+
+        if 0 <= restored_brightness <= 255:
+            return restored_brightness
+
+        return None
+
     @property
     def color_mode(self) -> str:
         """Return the color mode of the light."""
@@ -151,35 +228,53 @@ class LightenerLight(LightGroup):
         if not self.is_on:
             return None
 
-        # If the controlled lights are on/off only, we force the color mode to BRIGHTNESS
-        # since Lightner always support it.
-        if self._attr_color_mode == ColorMode.ONOFF:
-            return ColorMode.BRIGHTNESS
+        supported_color_modes = self._supported_color_modes()
+        color_mode = self._attr_color_mode
 
-        # The group may calculate the color mode as UNKNOWN if any of the controlled lights is UNKNOWN.
-        # We don't want that, so we force it to BRIGHTNESS.
-        if self._attr_color_mode == ColorMode.UNKNOWN:
-            return ColorMode.BRIGHTNESS
+        if (
+            color_mode
+            and color_mode != ColorMode.UNKNOWN
+            and color_mode != ColorMode.ONOFF
+            and color_mode in supported_color_modes
+        ):
+            return color_mode
 
-        return self._attr_color_mode
+        for fallback_mode in (
+            ColorMode.BRIGHTNESS,
+            ColorMode.COLOR_TEMP,
+            ColorMode.HS,
+            ColorMode.RGB,
+            ColorMode.RGBW,
+            ColorMode.RGBWW,
+            ColorMode.WHITE,
+            ColorMode.XY,
+        ):
+            if fallback_mode in supported_color_modes:
+                return fallback_mode
+
+        return ColorMode.BRIGHTNESS
 
     @property
     def supported_color_modes(self) -> set[str] | None:
         """Flag supported color modes."""
 
-        color_modes = super().supported_color_modes or set()
+        return self._supported_color_modes()
+
+    def _supported_color_modes(self) -> set[str]:
+        """Return Lightener-supported color modes without mutating group state."""
+
+        color_modes = set(super().supported_color_modes or set())
 
         # We support BRIGHNESS if the controlled lights are not on/off only.
         color_modes.discard(ColorMode.ONOFF)
 
-        if len(color_modes) == 0:
-            # As a minimum, we support the current color mode, or default to BRIGHTNESS.
+        if not color_modes:
             if (
-                self.color_mode
-                and self.color_mode != ColorMode.UNKNOWN
-                and self.color_mode != ColorMode.ONOFF
+                self._attr_color_mode
+                and self._attr_color_mode != ColorMode.UNKNOWN
+                and self._attr_color_mode != ColorMode.ONOFF
             ):
-                color_modes.add(self.color_mode)
+                color_modes.add(self._attr_color_mode)
             else:
                 color_modes.add(ColorMode.BRIGHTNESS)
 
@@ -206,12 +301,10 @@ class LightenerLight(LightGroup):
         if brightness is None:
             brightness = self._preferred_brightness
 
-        if brightness is None:
-            brightness = 255
-
         self._attr_is_on = True
-        self._attr_brightness = brightness
-        self._preferred_brightness = brightness
+        if brightness is not None:
+            self._attr_brightness = brightness
+            self._preferred_brightness = brightness
 
         _LOGGER.debug(
             "[Turn On] Attempting to set brightness of `%s` to `%s`",
@@ -220,7 +313,6 @@ class LightenerLight(LightGroup):
         )
 
         self._is_frozen = True
-        desired_brightness_by_entity: dict[str, int] = {}
 
         async def _safe_service_call(
             entity: LightenerControlledLight, service: str, entity_data: dict
@@ -242,10 +334,13 @@ class LightenerLight(LightGroup):
                     entity_data,
                 )
 
-                if service == SERVICE_TURN_ON and ATTR_BRIGHTNESS in entity_data:
-                    desired_brightness_by_entity[entity.entity_id] = entity_data[
-                        ATTR_BRIGHTNESS
-                    ]
+                if (
+                    service == SERVICE_TURN_ON
+                    and self._has_child_correction_target(entity_data)
+                ):
+                    self._pending_child_turn_on[entity.entity_id] = entity_data.copy()
+                    self._immediate_child_corrections.discard(entity.entity_id)
+                    self._cancel_child_correction(entity.entity_id)
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.exception(
                     "Service `%s` for `%s` (%s) failed: %s; payload=%s",
@@ -260,22 +355,23 @@ class LightenerLight(LightGroup):
             async with asyncio.TaskGroup() as group:
                 for entity in self._entities:
                     service = SERVICE_TURN_ON
-                    entity_brightness = entity.translate_brightness(brightness)
+                    entity_data = data.copy()
 
-                    # If the light brightness level is zero, we turn it off instead.
-                    if entity_brightness == 0:
-                        service = SERVICE_TURN_OFF
-                        entity_data = {}
+                    if brightness is not None:
+                        entity_brightness = entity.translate_brightness(brightness)
 
-                        # "Transition" is the only additional data allowed with the turn_off service.
-                        if ATTR_TRANSITION in data:
-                            entity_data[ATTR_TRANSITION] = data[ATTR_TRANSITION]
-                    else:
-                        # Make a copy of the data being sent to the lightener call so we can modify it.
-                        entity_data = data.copy()
+                        # If the light brightness level is zero, we turn it off instead.
+                        if entity_brightness == 0:
+                            service = SERVICE_TURN_OFF
+                            entity_data = {}
+                            self._clear_child_correction(entity.entity_id)
 
-                        # Set the translated brightness level.
-                        entity_data[ATTR_BRIGHTNESS] = entity_brightness
+                            # "Transition" is the only additional data allowed with the turn_off service.
+                            if ATTR_TRANSITION in data:
+                                entity_data[ATTR_TRANSITION] = data[ATTR_TRANSITION]
+                        else:
+                            # Set the translated brightness level.
+                            entity_data[ATTR_BRIGHTNESS] = entity_brightness
 
                     # Set the proper entity ID.
                     entity_data[ATTR_ENTITY_ID] = entity.entity_id
@@ -285,22 +381,8 @@ class LightenerLight(LightGroup):
         finally:
             self._is_frozen = False
 
-        # Define a coroutine as a ha task.
-        async def _async_refresh() -> None:
-            """Refresh Lightener state after child service calls settle."""
-            self.async_update_group_state()
-            self.async_write_ha_state()
-
-            if desired_brightness_by_entity:
-                await asyncio.sleep(0)
-                await self._async_correct_child_brightness(desired_brightness_by_entity)
-                self.async_update_group_state()
-                self.async_write_ha_state()
-
-        # Schedule the task to run.
-        self.hass.async_create_task(
-            _async_refresh(), name="Lightener [turn_on refresh]"
-        )
+        self.async_update_group_state()
+        self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn off all lights controlled by this Lightener."""
@@ -314,6 +396,7 @@ class LightenerLight(LightGroup):
 
             _LOGGER.debug("[Turn Off] Turned off `%s`", self.entity_id)
 
+            self._clear_child_corrections()
             self._attr_is_on = False
             self._attr_brightness = None
         finally:
@@ -354,49 +437,160 @@ class LightenerLight(LightGroup):
             self._attr_brightness,
         )
 
-    async def _async_correct_child_brightness(
-        self, desired_brightness_by_entity: dict[str, int]
-    ) -> None:
-        """Re-apply brightness to children that restored a stale level on turn_on."""
+    @callback
+    def _async_maybe_correct_child_state(self, entity_id: str, state) -> None:
+        """Schedule correction if a child reports stale target attributes."""
 
-        for entity_id, brightness in desired_brightness_by_entity.items():
-            state = self.hass.states.get(entity_id)
+        target_data = self._pending_child_turn_on.get(entity_id)
 
-            if state is None or state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+        if (
+            target_data is None
+            or state is None
+            or state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE)
+        ):
+            return
+
+        if self._child_state_matches_target(state, target_data):
+            self._clear_child_correction(entity_id)
+            return
+
+        if entity_id not in self._immediate_child_corrections:
+            self._immediate_child_corrections.add(entity_id)
+            self.hass.async_create_task(
+                self._async_correct_child(entity_id, target_data.copy()),
+                name=f"Lightener [child correction {entity_id}]",
+            )
+            return
+
+        self._async_schedule_child_correction(
+            entity_id,
+            target_data,
+            delay=self._child_correction_debounce,
+        )
+
+    def _child_state_matches_target(self, state, target_data: dict[str, Any]) -> bool:
+        """Return true if a child state already matches the target command."""
+
+        if state.state != STATE_ON:
+            return False
+
+        for attr, target_value in target_data.items():
+            if attr in (ATTR_ENTITY_ID, ATTR_TRANSITION):
                 continue
 
-            current_brightness = state.attributes.get(ATTR_BRIGHTNESS)
-            if state.state == STATE_ON and (
-                current_brightness is None
-                or abs(int(current_brightness) - brightness) <= 1
+            current_value = state.attributes.get(attr)
+
+            if current_value is None:
+                continue
+
+            if attr == ATTR_BRIGHTNESS:
+                if abs(int(current_value) - int(target_value)) > 1:
+                    return False
+                continue
+
+            if isinstance(current_value, (list, tuple)) or isinstance(
+                target_value, (list, tuple)
             ):
+                if not isinstance(current_value, (list, tuple)) or not isinstance(
+                    target_value, (list, tuple)
+                ):
+                    return False
+
+                if tuple(current_value) != tuple(target_value):
+                    return False
                 continue
 
-            entity_data = {
-                ATTR_ENTITY_ID: entity_id,
-                ATTR_BRIGHTNESS: brightness,
-            }
+            if current_value != target_value:
+                return False
 
-            try:
-                await self.hass.services.async_call(
-                    LIGHT_DOMAIN,
-                    SERVICE_TURN_ON,
-                    entity_data,
-                    blocking=True,
-                    context=self._context,
-                )
-                _LOGGER.debug(
-                    "Corrected brightness of `%s` to `%s` after turn_on",
-                    entity_id,
-                    brightness,
-                )
-            except Exception as exc:  # noqa: BLE001
-                _LOGGER.exception(
-                    "Brightness correction for `%s` failed: %s; payload=%s",
-                    entity_id,
-                    exc,
-                    entity_data,
-                )
+        return True
+
+    @staticmethod
+    def _has_child_correction_target(target_data: dict[str, Any]) -> bool:
+        """Return true if turn_on data has state attributes worth correcting."""
+
+        return any(
+            attr not in (ATTR_ENTITY_ID, ATTR_TRANSITION) for attr in target_data
+        )
+
+    @callback
+    def _async_schedule_child_correction(
+        self, entity_id: str, target_data: dict[str, Any], delay: float
+    ) -> None:
+        """Schedule brightness/color correction for a child."""
+
+        self._cancel_child_correction(entity_id)
+
+        async def _async_run_correction(_now) -> None:
+            self._child_correction_unsubs.pop(entity_id, None)
+            await self._async_correct_child(entity_id, target_data.copy())
+
+        self._child_correction_unsubs[entity_id] = async_call_later(
+            self.hass, delay, _async_run_correction
+        )
+
+    @callback
+    def _cancel_child_correction(self, entity_id: str) -> None:
+        """Cancel any scheduled correction for a child."""
+
+        unsub = self._child_correction_unsubs.pop(entity_id, None)
+        if unsub is not None:
+            unsub()
+
+    @callback
+    def _clear_child_correction(self, entity_id: str) -> None:
+        """Clear pending correction state for a child."""
+
+        self._pending_child_turn_on.pop(entity_id, None)
+        self._immediate_child_corrections.discard(entity_id)
+        self._cancel_child_correction(entity_id)
+
+    @callback
+    def _clear_child_corrections(self) -> None:
+        """Clear all pending child corrections."""
+
+        for entity_id in list(self._child_correction_unsubs):
+            self._cancel_child_correction(entity_id)
+
+        self._pending_child_turn_on.clear()
+        self._immediate_child_corrections.clear()
+
+    async def _async_correct_child(
+        self, entity_id: str, target_data: dict[str, Any]
+    ) -> None:
+        """Re-apply turn_on data after a child reports a stale state."""
+
+        pending_data = self._pending_child_turn_on.get(entity_id)
+        if pending_data != target_data:
+            return
+
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+            return
+        if self._child_state_matches_target(state, target_data):
+            self._clear_child_correction(entity_id)
+            return
+
+        try:
+            await self.hass.services.async_call(
+                LIGHT_DOMAIN,
+                SERVICE_TURN_ON,
+                target_data,
+                blocking=True,
+                context=self._context,
+            )
+            _LOGGER.debug(
+                "Corrected state of `%s` after child state update with `%s`",
+                entity_id,
+                target_data,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.exception(
+                "State correction for `%s` failed: %s; payload=%s",
+                entity_id,
+                exc,
+                target_data,
+            )
 
     @callback
     def async_write_ha_state(self) -> None:

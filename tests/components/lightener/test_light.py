@@ -1,14 +1,29 @@
 """Tests for the light platform."""
 
+import asyncio
 from unittest.mock import ANY, Mock, patch
 from uuid import uuid4
 
 import pytest
-from homeassistant.components.light import ATTR_BRIGHTNESS, ATTR_TRANSITION, ColorMode
+from homeassistant.components.light import (
+    ATTR_BRIGHTNESS,
+    ATTR_BRIGHTNESS_PCT,
+    ATTR_SUPPORTED_COLOR_MODES,
+    ATTR_RGB_COLOR,
+    ATTR_TRANSITION,
+    ColorMode,
+)
 from homeassistant.components.light import DATA_PROFILES, Profile
 from homeassistant.components.light import DOMAIN as LIGHT_DOMAIN
 from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TURN_OFF, SERVICE_TURN_ON
-from homeassistant.core import HomeAssistant, ServiceRegistry
+from homeassistant.core import HomeAssistant, ServiceRegistry, State
+from homeassistant.helpers.restore_state import (
+    RestoredExtraData,
+    RestoreEntity,
+    StoredState,
+    async_get as async_get_restore_state,
+)
+from homeassistant.util import dt as dt_util
 
 from custom_components.lightener.const import TYPE_DIMMABLE, TYPE_ONOFF
 from custom_components.lightener.light import (
@@ -197,10 +212,10 @@ async def test_lightener_light_turn_on_keeps_own_state_when_all_children_map_off
     assert hass.states.get(lightener.entity_id).attributes[ATTR_BRIGHTNESS] == 1
 
 
-async def test_lightener_light_turn_on_without_brightness_maps_default_level(
+async def test_lightener_light_turn_on_without_known_brightness_does_not_default_to_full(
     hass: HomeAssistant, create_lightener
 ):
-    """Test plain turn_on still applies mapping through Lightener's default level."""
+    """Test first plain turn_on does not invent a full-brightness level."""
 
     lightener: LightenerLight = await create_lightener(
         config={
@@ -208,15 +223,82 @@ async def test_lightener_light_turn_on_without_brightness_maps_default_level(
             "entities": {"light.test1": {"100": "0"}},
         }
     )
+    calls: list[tuple[str, dict]] = []
 
-    await lightener.async_turn_on()
+    async def fake_async_call(
+        self, domain, service, data, blocking=True, context=None
+    ):  # pylint: disable=unused-argument
+        calls.append((service, data.copy()))
+
+    with patch.object(
+        ServiceRegistry, "async_call", side_effect=fake_async_call, autospec=True
+    ):
+        await lightener.async_turn_on()
+        await hass.async_block_till_done()
+
+    assert calls == [(SERVICE_TURN_ON, {ATTR_ENTITY_ID: "light.test1"})]
+    assert lightener.is_on is True
+    assert lightener.brightness is None
+
+
+async def test_lightener_light_turn_on_uses_restored_brightness(
+    hass: HomeAssistant, create_lightener
+):
+    """Test first plain turn_on uses the last restored Lightener brightness."""
+
+    async_get_restore_state(hass).last_states["light.test"] = StoredState(
+        State("light.test", "off", {}),
+        RestoredExtraData({"preferred_brightness": 178}),
+        dt_util.utcnow(),
+    )
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.test1": {"100": "70"}},
+        }
+    )
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_async_call(
+        self, domain, service, data, blocking=True, context=None
+    ):  # pylint: disable=unused-argument
+        calls.append((service, data.copy()))
+
+    with patch.object(
+        ServiceRegistry, "async_call", side_effect=fake_async_call, autospec=True
+    ):
+        await lightener.async_turn_on()
+        await hass.async_block_till_done()
+
+    assert isinstance(lightener, RestoreEntity)
+    assert lightener.brightness == 178
+    assert calls == [
+        (SERVICE_TURN_ON, {ATTR_ENTITY_ID: "light.test1", ATTR_BRIGHTNESS: 124})
+    ]
+
+
+async def test_lightener_light_restore_data_keeps_last_brightness_when_off(
+    hass: HomeAssistant, create_lightener
+):
+    """Test restore data keeps preferred brightness after Lightener turns off."""
+
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.test1": {"100": "70"}},
+        }
+    )
+
+    await lightener.async_turn_on(brightness=178)
     await hass.async_block_till_done()
 
-    assert hass.states.get("light.test1").state == "off"
-    assert lightener.is_on is True
-    assert lightener.brightness == 255
-    assert hass.states.get(lightener.entity_id).state == "on"
-    assert hass.states.get(lightener.entity_id).attributes[ATTR_BRIGHTNESS] == 255
+    await lightener.async_turn_off()
+    await hass.async_block_till_done()
+
+    assert lightener.brightness is None
+    assert lightener.extra_restore_state_data.as_dict() == {
+        "preferred_brightness": 178
+    }
 
 
 async def test_lightener_light_service_turn_on_maps_default_profile_brightness(
@@ -293,10 +375,133 @@ async def test_lightener_light_service_turn_on_maps_remembered_brightness(
     assert hass.states.get("light.test1").attributes[ATTR_BRIGHTNESS] == 124
 
 
+async def test_lightener_light_service_turn_on_updates_parent_brightness_while_on(
+    hass: HomeAssistant, create_lightener
+):
+    """Test Lightener state stores brightness changes made to the Lightener entity."""
+
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.test1": {"100": "70"}},
+        }
+    )
+
+    await hass.services.async_call(
+        LIGHT_DOMAIN,
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: lightener.entity_id, ATTR_BRIGHTNESS: 255},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    await hass.services.async_call(
+        LIGHT_DOMAIN,
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: lightener.entity_id, ATTR_BRIGHTNESS: 178},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    assert lightener.brightness == 178
+    assert hass.states.get(lightener.entity_id).attributes[ATTR_BRIGHTNESS] == 178
+    assert hass.states.get("light.test1").attributes[ATTR_BRIGHTNESS] == 124
+
+
+async def test_lightener_light_service_turn_on_preserves_adaptive_brightness(
+    hass: HomeAssistant, create_lightener
+):
+    """Test an external turn_on brightness adaptation updates Lightener state."""
+
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.test1": {"100": "70"}},
+        }
+    )
+
+    await hass.services.async_call(
+        LIGHT_DOMAIN,
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: lightener.entity_id, ATTR_BRIGHTNESS: 255},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    await hass.services.async_call(
+        LIGHT_DOMAIN,
+        SERVICE_TURN_ON,
+        {
+            ATTR_ENTITY_ID: lightener.entity_id,
+            ATTR_BRIGHTNESS_PCT: 40,
+            ATTR_TRANSITION: 1,
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    assert lightener.brightness == 102
+    assert hass.states.get(lightener.entity_id).attributes[ATTR_BRIGHTNESS] == 102
+    assert hass.states.get("light.test1").attributes[ATTR_BRIGHTNESS] == 71
+
+
+async def test_lightener_light_turn_on_preserves_intercepted_adaptive_brightness(
+    hass: HomeAssistant, create_lightener
+):
+    """Test Adaptive Lighting-style intercepted kwargs update Lightener state."""
+
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.test1": {"100": "70"}},
+        }
+    )
+
+    await lightener.async_turn_on(brightness=255)
+    await hass.async_block_till_done()
+
+    await lightener.async_turn_on(brightness=102, transition=1)
+    await hass.async_block_till_done()
+
+    assert lightener.brightness == 102
+    assert hass.states.get(lightener.entity_id).attributes[ATTR_BRIGHTNESS] == 102
+    assert hass.states.get("light.test1").attributes[ATTR_BRIGHTNESS] == 71
+
+
+async def test_lightener_light_turn_on_writes_parent_state_once_without_child_updates(
+    hass: HomeAssistant, create_lightener
+):
+    """Test turn_on writes one parent state update when children do not update."""
+
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.test1": {"100": "70"}},
+        }
+    )
+
+    async def fake_async_call(
+        self, domain, service, data, blocking=True, context=None
+    ):  # pylint: disable=unused-argument
+        return None
+
+    with patch.object(
+        ServiceRegistry, "async_call", side_effect=fake_async_call, autospec=True
+    ), patch.object(
+        lightener, "async_write_ha_state", wraps=lightener.async_write_ha_state
+    ) as async_write_ha_state:
+        await lightener.async_turn_on(brightness=178)
+        await hass.async_block_till_done()
+
+    assert async_write_ha_state.call_count == 1
+    assert lightener.brightness == 178
+    assert hass.states.get(lightener.entity_id).attributes[ATTR_BRIGHTNESS] == 178
+
+
 async def test_lightener_light_turn_on_corrects_stale_child_brightness(
     hass: HomeAssistant, create_lightener
 ):
-    """Test turn_on corrects a child that restores stale brightness after turn_on."""
+    """Test child state changes drive stale brightness correction."""
 
     lightener: LightenerLight = await create_lightener(
         config={
@@ -315,10 +520,12 @@ async def test_lightener_light_turn_on_corrects_stale_child_brightness(
             domain == LIGHT_DOMAIN
             and service == SERVICE_TURN_ON
             and data[ATTR_ENTITY_ID] == "light.test1"
+            and len(calls) == 2
         ):
-            brightness = 39 if len(calls) == 1 else data[ATTR_BRIGHTNESS]
             hass.states.async_set(
-                "light.test1", "on", attributes={ATTR_BRIGHTNESS: brightness}
+                "light.test1",
+                "on",
+                attributes={ATTR_BRIGHTNESS: data[ATTR_BRIGHTNESS]},
             )
 
     with patch.object(
@@ -327,11 +534,124 @@ async def test_lightener_light_turn_on_corrects_stale_child_brightness(
         await lightener.async_turn_on(brightness=178)
         await hass.async_block_till_done()
 
+        assert calls == [{ATTR_ENTITY_ID: "light.test1", ATTR_BRIGHTNESS: 124}]
+
+        hass.states.async_set(
+            "light.test1", "on", attributes={ATTR_BRIGHTNESS: 39}
+        )
+        await hass.async_block_till_done()
+
     assert calls == [
         {ATTR_ENTITY_ID: "light.test1", ATTR_BRIGHTNESS: 124},
         {ATTR_ENTITY_ID: "light.test1", ATTR_BRIGHTNESS: 124},
     ]
     assert hass.states.get("light.test1").attributes[ATTR_BRIGHTNESS] == 124
+
+
+async def test_lightener_light_debounces_repeated_child_corrections(
+    hass: HomeAssistant, create_lightener
+):
+    """Test first stale child correction is immediate and later ones debounce."""
+
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.test1": {"100": "70"}},
+        }
+    )
+    lightener._child_correction_debounce = 0.05  # pylint: disable=protected-access
+    calls: list[dict] = []
+
+    async def fake_async_call(
+        self, domain, service, data, blocking=True, context=None
+    ):  # pylint: disable=unused-argument
+        calls.append(data.copy())
+
+    with patch.object(
+        ServiceRegistry, "async_call", side_effect=fake_async_call, autospec=True
+    ):
+        await lightener.async_turn_on(brightness=178)
+        await hass.async_block_till_done()
+
+        hass.states.async_set(
+            "light.test1", "on", attributes={ATTR_BRIGHTNESS: 39}
+        )
+        await hass.async_block_till_done()
+        assert len(calls) == 2
+
+        hass.states.async_set(
+            "light.test1", "on", attributes={ATTR_BRIGHTNESS: 40}
+        )
+        await asyncio.sleep(0)
+        assert len(calls) == 2
+
+        await asyncio.sleep(0.06)
+        await hass.async_block_till_done()
+
+    assert calls == [
+        {ATTR_ENTITY_ID: "light.test1", ATTR_BRIGHTNESS: 124},
+        {ATTR_ENTITY_ID: "light.test1", ATTR_BRIGHTNESS: 124},
+        {ATTR_ENTITY_ID: "light.test1", ATTR_BRIGHTNESS: 124},
+    ]
+
+
+async def test_lightener_light_child_correction_reapplies_color(
+    hass: HomeAssistant, create_lightener
+):
+    """Test stale child color is corrected with the full turn_on payload."""
+
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.test_temp": {}},
+        }
+    )
+    calls: list[dict] = []
+
+    async def fake_async_call(
+        self, domain, service, data, blocking=True, context=None
+    ):  # pylint: disable=unused-argument
+        calls.append(data.copy())
+
+    with patch.object(
+        ServiceRegistry, "async_call", side_effect=fake_async_call, autospec=True
+    ):
+        await lightener.async_turn_on(
+            brightness=178,
+            rgb_color=(10, 20, 30),
+        )
+        await hass.async_block_till_done()
+
+        assert calls == [
+            {
+                ATTR_ENTITY_ID: "light.test_temp",
+                ATTR_BRIGHTNESS: 178,
+                ATTR_RGB_COLOR: (10, 20, 30),
+            }
+        ]
+
+        hass.states.async_set(
+            "light.test_temp",
+            "on",
+            attributes={
+                ATTR_BRIGHTNESS: 178,
+                ATTR_RGB_COLOR: (1, 2, 3),
+            },
+        )
+        await hass.async_block_till_done()
+
+    assert calls == [
+        {
+            ATTR_ENTITY_ID: "light.test_temp",
+            ATTR_BRIGHTNESS: 178,
+            ATTR_RGB_COLOR: (10, 20, 30),
+        },
+        {
+            ATTR_ENTITY_ID: "light.test_temp",
+            ATTR_BRIGHTNESS: 178,
+            ATTR_RGB_COLOR: (10, 20, 30),
+        },
+    ]
 
 
 async def test_lightener_light_turn_on_translate_brightness(
@@ -484,7 +804,7 @@ async def test_lightener_light_color_mode_onoff(hass: HomeAssistant, create_ligh
 async def test_lightener_light_color_mode_unknown(
     hass: HomeAssistant, create_lightener
 ):
-    """Test that Lightener keeps its color mode to BRIGHTNESS with a controlled light that has color_mode UNKNOWN."""
+    """Test Lightener uses a supported mode when child color_mode is UNKNOWN."""
 
     lightener: LightenerLight = await create_lightener(
         config={
@@ -502,7 +822,7 @@ async def test_lightener_light_color_mode_unknown(
     await lightener.async_turn_on(brightness=1)
     await hass.async_block_till_done()
 
-    assert lightener.color_mode == ColorMode.BRIGHTNESS
+    assert lightener.color_mode == ColorMode.COLOR_TEMP
 
     assert (
         hass.states.get("light.test_temp").attributes["color_mode"] == ColorMode.UNKNOWN
@@ -513,6 +833,30 @@ async def test_lightener_light_color_mode_unknown(
     await hass.async_block_till_done()
 
     assert lightener.color_mode is None
+
+
+async def test_lightener_light_color_mode_unknown_uses_supported_child_mode(
+    hass: HomeAssistant, create_lightener
+):
+    """Test unknown child color mode does not force unsupported brightness mode."""
+
+    lightener: LightenerLight = await create_lightener(
+        config={
+            "friendly_name": "Test",
+            "entities": {"light.color_temp_only": {}},
+        }
+    )
+
+    hass.states.async_set(
+        entity_id="light.color_temp_only",
+        new_state="off",
+        attributes={ATTR_SUPPORTED_COLOR_MODES: [ColorMode.COLOR_TEMP]},
+    )
+    lightener.async_update_group_state()
+    lightener._attr_is_on = True  # pylint: disable=protected-access
+
+    assert lightener.supported_color_modes == {ColorMode.COLOR_TEMP}
+    assert lightener.color_mode == ColorMode.COLOR_TEMP
 
 
 async def test_lightener_light_async_update_group_state(
