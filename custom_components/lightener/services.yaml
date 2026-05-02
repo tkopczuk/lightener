@@ -1,0 +1,28 @@
+update_entity_settings:
+  name: Update entity settings
+  description: Update a Lightener entity's UI-configurable settings and reload it.
+  fields:
+    entity_id:
+      name: Lightener entity
+      description: The Lightener light entity to update.
+      required: true
+      selector:
+        entity:
+          domain: light
+    friendly_name:
+      name: Friendly name
+      description: The display name used for the Lightener device.
+      required: false
+      selector:
+        text:
+    entities:
+      name: Controlled entities
+      description: Mapping of controlled light entities to their brightness settings.
+      required: false
+      example:
+        light.ceiling:
+          brightness:
+            60: 0
+            100: 100
+      selector:
+        object:

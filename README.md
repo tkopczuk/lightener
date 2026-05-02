@@ -76,6 +76,31 @@ Once the configuration is confirmed, a new device becomes available, which can b
 
 One light to rule them all!
 
+## Updating Settings From Services
+
+Lightener also exposes the `lightener.update_entity_settings` service for automations or scripts that need to update the same settings available in the UI.
+
+The service targets one Lightener light entity. `friendly_name` and `entities` are optional, but at least one must be supplied. When `entities` is supplied, it replaces the controlled-light list for that Lightener and reloads the config entry.
+
+```yaml
+service: lightener.update_entity_settings
+data:
+  entity_id: light.living_room
+  friendly_name: Living Room
+  entities:
+    light.main_ceiling:
+      brightness:
+        60: 0
+        100: 100
+    light.ceiling_leds:
+      brightness:
+        80: 100
+    light.sofa_lamp:
+      brightness:
+        20: 0
+        60: 100
+```
+
 ### Support for On/Off Lights
 
 Lightener supports controlling so-called "On/Off Lights." These are lights that cannot be dimmed but can only be turned on and off.

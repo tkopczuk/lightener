@@ -10,6 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntry
 
 from .config_flow import LightenerConfigFlow
+from .services import async_setup_services
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -18,6 +19,8 @@ PLATFORMS = [Platform.LIGHT]
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up platform from a config entry."""
+
+    async_setup_services(hass)
 
     hass.async_create_task(
         hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
